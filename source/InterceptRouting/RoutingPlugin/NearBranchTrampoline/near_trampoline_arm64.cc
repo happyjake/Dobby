@@ -63,14 +63,21 @@ CodeBufferBase *GenerateNearTrampolineBuffer(InterceptRouting *routing, addr_t s
   TurboAssembler turbo_assembler_((void *)src);
 #define _ turbo_assembler_.
 
+  // See trampoline_arm64.cc -- when patching a BTI-guarded library (libart
+  // etc.) the overwritten entry must begin with a BTI landing pad, otherwise
+  // indirect callers (BLR/BR) hit a Branch Target Exception. Emit `bti jc`
+  // and adjust the relative branch displacement by 4 to compensate.
+  _ Emit(0xD50324DFu); // bti jc
+  addr_t branch_src = src + 4;
+
   // branch to trampoline_target directly
-  if (llabs((long long)dst - (long long)src) < ARM64_B_XXX_RANGE) {
-    _ b(dst - src);
+  if (llabs((long long)dst - (long long)branch_src) < ARM64_B_XXX_RANGE) {
+    _ b(dst - branch_src);
   } else {
-    auto fast_forward_trampoline = GenerateFastForwardTrampoline(src, dst);
+    auto fast_forward_trampoline = GenerateFastForwardTrampoline(branch_src, dst);
     if (!fast_forward_trampoline)
       return nullptr;
-    _ b(fast_forward_trampoline->addr - src);
+    _ b(fast_forward_trampoline->addr - branch_src);
   }
 
   // free the original trampoline
