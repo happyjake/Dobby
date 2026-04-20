@@ -6,11 +6,23 @@
 using namespace zz;
 
 void log_hex_format(uint8_t *buffer, uint32_t buffer_size) {
+#if !defined(DOBBY_LOGGING_DISABLE)
+  // Only do the strlen/snprintf loop when logging will actually emit.
+  // The loop has observable side effects (snprintf), so the compiler
+  // can't dead-code-eliminate it even though the output buffer is
+  // thrown away -- and on A16+ callers sometimes pass addresses that
+  // live inside guard pages (stale symbol cache, mis-resolved
+  // ArtMethod entry_point_from_quick_compiled_code_, etc.), which
+  // SIGSEGVs the first `*buffer` read. Guard it here.
   char output[1024] = {0};
   for (int i = 0; i < buffer_size && i < sizeof(output); i++) {
     snprintf(output + strlen(output), 3, "%02x", *((uint8_t *)buffer + i));
   }
   DEBUG_LOG("%s", output);
+#else
+  (void)buffer;
+  (void)buffer_size;
+#endif
 };
 
 void InterceptRouting::Prepare() {
