@@ -159,9 +159,24 @@ MemBlock *NearMemoryAllocator::allocateNearBlockFromUnusedRegion(uint32_t size, 
   auto unused_arena_size = unused_arena_end_page_addr - unused_arena_first_page_addr + OSMemory::PageSize();
   auto unused_arena_addr = unused_arena_first_page_addr;
 
-  if (OSMemory::Allocate(unused_arena_size, kNoAccess, (void *)unused_arena_addr) == nullptr) {
-    ERROR_LOG("[near memory allocator] allocate fixed page failed %p", unused_arena_addr);
-    return nullptr;
+  // Allocate with the final permission directly. On Android 16+ MDWE
+  // refuses mprotect transitions to PROT_EXEC on any VMA that did not
+  // previously have VM_EXEC -- so the old `Allocate(kNoAccess) + then
+  // SetPermission(kReadExecute)` dance silently left the arena at
+  // PROT_NONE, and every subsequent code write or execute SIGSEGV'd on
+  // what looked like a guard page. Anonymous mmap with PROT_READ|
+  // PROT_EXEC is permitted under MDWE because the new VMA is born R+X
+  // and never has PROT_WRITE.
+  auto initial_perm = executable ? kReadExecute : kReadWrite;
+  if (OSMemory::Allocate(unused_arena_size, initial_perm, (void *)unused_arena_addr) == nullptr) {
+    // Fallback to the legacy kNoAccess + mprotect path (probably won't
+    // get us further than before if MDWE is why the direct R+X failed,
+    // but retains behavior for platforms where direct R+X is rejected).
+    if (OSMemory::Allocate(unused_arena_size, kNoAccess, (void *)unused_arena_addr) == nullptr) {
+      ERROR_LOG("[near memory allocator] allocate fixed page failed %p", unused_arena_addr);
+      return nullptr;
+    }
+    OSMemory::SetPermission((void *)unused_arena_addr, unused_arena_size, initial_perm);
   }
 
   auto register_near_arena = [&](addr_t arena_addr, size_t arena_size) -> MemoryArena * {
@@ -173,7 +188,7 @@ MemBlock *NearMemoryAllocator::allocateNearBlockFromUnusedRegion(uint32_t size, 
       arena = new DataMemoryArena(arena_addr, arena_size);
       default_allocator->data_arenas.push_back(arena);
     }
-    OSMemory::SetPermission((void *)arena->addr, arena->size, executable ? kReadExecute : kReadWrite);
+    // Permission was set at allocation time; nothing more to do here.
     return arena;
   };
 
