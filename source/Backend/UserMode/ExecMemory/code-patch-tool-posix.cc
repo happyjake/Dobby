@@ -6,7 +6,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -20,47 +23,133 @@
 #define DOBBY_DIAG(lvl, fmt, ...) ((void)0)
 #endif
 
+// memfd_create flags -- not always in older <sys/mman.h> on NDK r27
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+#ifndef MFD_EXEC
+#define MFD_EXEC 0x0010U
+#endif
+
 #if !defined(__APPLE__)
 
-// On Android 16+ W^X is strictly enforced. Two related traps:
+// On Android 16+ W^X is strictly enforced:
 //
 // 1) mprotect(PROT_READ|PROT_WRITE|PROT_EXEC) silently drops EXEC (or fails
 //    with EACCES), leaving the page RW-only. memcpy then succeeds but
 //    CPU branches into the page SIGSEGV with SEGV_ACCERR.
 //
-// 2) Writing to an executable page via /proc/self/mem bypasses VMA
-//    protection checks but the kernel still strips PROT_EXEC from the
-//    VMA as part of the write (COW on file-backed executable mappings).
-//    The written code is correct but the page is no longer executable.
+// 2) /proc/self/mem pwrite bypasses VMA protection checks, but the kernel
+//    strips PROT_EXEC from the VMA as part of the write (COW on
+//    file-backed executable mappings). The bytes are correct but the page
+//    is no longer executable.
 //
-// Fix strategy (sequential W -> X transitions are allowed; only
-// simultaneous W+X is forbidden):
-//   a) Ensure the page is writable: mprotect(R+W), or rely on
-//      /proc/self/mem's COW-and-write which accomplishes the same.
-//   b) memcpy / pwrite the new bytes.
-//   c) Restore PROT_READ|PROT_EXEC. Required whether we used
-//      mprotect or /proc/self/mem -- both paths leave the VMA in a
-//      non-executable state on A16+.
+// 3) On zygote64 children, mprotect(R+X) to re-add PROT_EXEC after a W
+//    transition is blocked by MDWE (PR_MDWE_REFUSE_EXEC_GAIN), returning
+//    EACCES. This is what bites Vector/LSPlant on nezha -- patching
+//    succeeds, protection restore silently fails, every indirect call
+//    into the page (virtual dispatch in libart) SIGSEGVs with
+//    "trying to execute non-executable memory".
 //
-// Observed on nezha / Android 16 (kernel 6.12): step (c) *silently fails*
-// in the zygote-child context, leaving libart code pages RW. Every
-// subsequent indirect call into the page faults with SEGV_ACCERR
-// ("trying to execute non-executable memory"). We now check the return
-// value and log errno so the root cause is visible instead of a
-// mysterious SetStatus+0 tombstone minutes later.
+// Fix:
+//   a) Try /proc/self/mem pwrite first (primary path).
+//   b) If that fails, do the mprotect dance (R+W, memcpy, try R+X).
+//   c) If force_rx fails with MDWE/EACCES, fall back to a
+//      memfd-backed mmap(MAP_FIXED, R+X) swap. This bypasses MDWE
+//      because the new VMA is born R+X -- it never had PROT_WRITE, so
+//      map_deny_write_exec doesn't fire.
+//
+// The memfd-swap path: allocate a memfd, write the *current contents*
+// of the page (which already contains the trampoline after step b), and
+// mmap(MAP_FIXED) it over the target page with R+X. This atomically
+// replaces the broken R+W VMA with a functioning R+X one that carries
+// the same bytes. Adjacent libart code on the same page is preserved
+// because we copy the whole page first.
+
+static int memfd_swap_to_rx(uintptr_t patch_page, size_t page_size) {
+  // 1. Read current (R+W) contents.
+  uint8_t *snapshot = (uint8_t *)malloc(page_size);
+  if (!snapshot) {
+    DOBBY_DIAG(ERROR, "memfd_swap: malloc %zu failed", page_size);
+    return -1;
+  }
+  memcpy(snapshot, (void *)patch_page, page_size);
+
+  // 2. memfd_create (prefer MFD_EXEC so the kernel knows we'll mmap R+X).
+  //    On arm64 Linux/Android, __NR_memfd_create == 279.
+#ifndef __NR_memfd_create
+#define __NR_memfd_create 279
+#endif
+  int memfd = (int)syscall(__NR_memfd_create, "dobby-patch", MFD_CLOEXEC | MFD_EXEC);
+  if (memfd < 0) {
+    int err1 = errno;
+    memfd = (int)syscall(__NR_memfd_create, "dobby-patch", MFD_CLOEXEC);
+    if (memfd < 0) {
+      DOBBY_DIAG(ERROR,
+                 "memfd_swap: memfd_create failed: MFD_EXEC errno=%d (%s), "
+                 "plain errno=%d (%s)",
+                 err1, strerror(err1), errno, strerror(errno));
+      free(snapshot);
+      return -1;
+    }
+  }
+
+  // 3. Fill memfd with the page snapshot.
+  if (ftruncate(memfd, page_size) != 0) {
+    DOBBY_DIAG(ERROR, "memfd_swap: ftruncate(memfd, %zu) errno=%d (%s)",
+               page_size, errno, strerror(errno));
+    close(memfd);
+    free(snapshot);
+    return -1;
+  }
+  ssize_t w = write(memfd, snapshot, page_size);
+  if (w != (ssize_t)page_size) {
+    DOBBY_DIAG(ERROR, "memfd_swap: write(memfd) returned %zd errno=%d (%s)",
+               w, errno, strerror(errno));
+    close(memfd);
+    free(snapshot);
+    return -1;
+  }
+  free(snapshot);
+
+  // 4. MAP_FIXED-swap over the target page with R+X. MDWE allows this
+  //    because the new VMA is born with exec and never has write.
+  void *mapped = mmap((void *)patch_page, page_size, PROT_READ | PROT_EXEC,
+                      MAP_FIXED | MAP_PRIVATE, memfd, 0);
+  if (mapped == MAP_FAILED) {
+    int err = errno;
+    DOBBY_DIAG(ERROR, "memfd_swap: mmap(MAP_FIXED|R+X) errno=%d (%s) page=0x%lx",
+               err, strerror(err), (unsigned long)patch_page);
+    close(memfd);
+    errno = err;
+    return -1;
+  }
+  close(memfd);
+  DOBBY_DIAG(INFO, "memfd_swap ok: page=0x%lx now R+X via memfd",
+             (unsigned long)patch_page);
+  return 0;
+}
 
 static int force_rx(void *page, size_t size) {
   int r = mprotect(page, size, PROT_READ | PROT_EXEC);
-  if (r != 0) {
-    int err = errno;
-    DOBBY_DIAG(ERROR,
-               "force_rx mprotect(R+X) FAILED: page=%p size=%zu errno=%d (%s)",
-               page, size, err, strerror(err));
-    errno = err;
-  } else {
-    DOBBY_DIAG(INFO, "force_rx(R+X) ok: page=%p size=%zu", page, size);
+  if (r == 0) {
+    DOBBY_DIAG(INFO, "force_rx mprotect(R+X) ok: page=%p size=%zu", page, size);
+    return 0;
   }
-  return r;
+  int err = errno;
+  DOBBY_DIAG(WARN,
+             "force_rx mprotect(R+X) failed: page=%p size=%zu errno=%d (%s) -- "
+             "attempting memfd-swap fallback",
+             page, size, err, strerror(err));
+  if (memfd_swap_to_rx((uintptr_t)page, size) == 0) {
+    return 0;
+  }
+  DOBBY_DIAG(ERROR,
+             "force_rx: both mprotect and memfd-swap failed for page %p; "
+             "hook will fail and caller must not invoke the trampoline",
+             page);
+  errno = err;
+  return -1;
 }
 
 static int write_via_proc_mem(void *address, const uint8_t *buffer, size_t size) {
@@ -114,7 +203,7 @@ PUBLIC int DobbyCodePatch(void *address, uint8_t *buffer, uint32_t buffer_size) 
   uintptr_t patch_page = ALIGN_FLOOR(address, page_size);
   uintptr_t patch_end_page = ALIGN_FLOOR((uintptr_t)address + buffer_size, page_size);
 
-  // Primary: /proc/self/mem, protection-agnostic write
+  // Primary: /proc/self/mem, protection-agnostic write.
   int rc = write_via_proc_mem(address, buffer, buffer_size);
   if (rc != 0) {
     DOBBY_DIAG(WARN, "proc_mem write failed for %p, falling back to mprotect path", address);
@@ -126,21 +215,20 @@ PUBLIC int DobbyCodePatch(void *address, uint8_t *buffer, uint32_t buffer_size) 
   }
 
   // Critical on Android 16+: the write (via either path) removes EXEC
-  // from the page's VMA. Re-add PROT_EXEC so future calls into this
-  // address don't SIGSEGV with "trying to execute non-executable memory".
+  // from the page's VMA. Re-add PROT_EXEC -- with memfd swap fallback
+  // when MDWE blocks the mprotect.
   if (force_rx((void *)patch_page, page_size) != 0) {
     DOBBY_DIAG(ERROR,
                "DobbyCodePatch: patch bytes WERE written to %p, but the page "
-               "could not be restored to R+X. The caller's hook WILL crash on "
-               "next invocation. Treating the patch as failed.",
+               "could not be restored to R+X. Treating the patch as failed.",
                address);
     return -1;
   }
   if (patch_page != patch_end_page) {
     if (force_rx((void *)patch_end_page, page_size) != 0) {
       DOBBY_DIAG(ERROR,
-                 "DobbyCodePatch: tail page 0x%lx (of patch at %p) could not be "
-                 "restored to R+X.",
+                 "DobbyCodePatch: tail page 0x%lx (of patch at %p) could not "
+                 "be restored to R+X.",
                  (unsigned long)patch_end_page, address);
       return -1;
     }
