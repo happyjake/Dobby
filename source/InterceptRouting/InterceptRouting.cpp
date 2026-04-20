@@ -3,6 +3,14 @@
 #include "InterceptRouting/InterceptRouting.h"
 #include "InterceptRouting/RoutingPlugin/RoutingPlugin.h"
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define DOBBY_DIAG_HOOK(fmt, ...) \
+  __android_log_print(ANDROID_LOG_INFO, "Dobby-hook", fmt, ##__VA_ARGS__)
+#else
+#define DOBBY_DIAG_HOOK(fmt, ...) ((void)0)
+#endif
+
 using namespace zz;
 
 void log_hex_format(uint8_t *buffer, uint32_t buffer_size) {
@@ -81,12 +89,20 @@ bool InterceptRouting::GenerateTrampolineBuffer(addr_t src, addr_t dst) {
 
 // active routing, patch origin instructions as trampoline
 void InterceptRouting::Active() {
+  DOBBY_DIAG_HOOK("Active target=0x%lx tramp_size=%zu",
+                  (unsigned long)entry_->patched_addr,
+                  (size_t)trampoline_buffer_->GetBufferSize());
   auto ret = DobbyCodePatch((void *)entry_->patched_addr, trampoline_buffer_->GetBuffer(),
                             trampoline_buffer_->GetBufferSize());
   if (ret == -1) {
+    DOBBY_DIAG_HOOK("Active FAILED target=0x%lx",
+                    (unsigned long)entry_->patched_addr);
     ERROR_LOG("[intercept routing] active failed");
     return;
   }
+  DOBBY_DIAG_HOOK("Active OK target=0x%lx relocated=0x%lx",
+                  (unsigned long)entry_->patched_addr,
+                  (unsigned long)entry_->relocated_addr);
   DEBUG_LOG("[intercept routing] active");
 }
 

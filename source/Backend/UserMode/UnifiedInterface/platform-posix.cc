@@ -39,6 +39,14 @@
 
 #endif
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define DOBBY_DIAG_ALLOC(fmt, ...) \
+  __android_log_print(ANDROID_LOG_INFO, "Dobby-alloc", fmt, ##__VA_ARGS__)
+#else
+#define DOBBY_DIAG_ALLOC(fmt, ...) ((void)0)
+#endif
+
 #include <string.h>
 
 #if defined(__APPLE__)
@@ -134,6 +142,12 @@ void *OSMemory::Allocate(size_t size, MemoryPermission access, void *fixed_addre
     flags = flags | MAP_FIXED;
   }
   void *result = mmap(fixed_address, size, prot, flags, kMmapFd, kMmapFdOffset);
+  int saved_errno = errno;
+  DOBBY_DIAG_ALLOC(
+      "OSMemory::Allocate size=0x%zx prot=0x%x flags=0x%x fixed=%p -> %p errno=%d (%s)",
+      size, prot, flags, fixed_address,
+      result == MAP_FAILED ? (void *)-1 : result, saved_errno,
+      result == MAP_FAILED ? strerror(saved_errno) : "ok");
   if (result == MAP_FAILED)
     return nullptr;
 
@@ -160,8 +174,13 @@ bool OSMemory::SetPermission(void *address, size_t size, MemoryPermission access
 
   int prot = GetProtectionFromMemoryPermission(access);
   int ret = mprotect(address, size, prot);
+  int saved_errno = errno;
+  DOBBY_DIAG_ALLOC(
+      "OSMemory::SetPermission addr=%p size=0x%zx prot=0x%x ret=%d errno=%d (%s)",
+      address, size, prot, ret, ret ? saved_errno : 0,
+      ret ? strerror(saved_errno) : "ok");
   if (ret) {
-    ERROR_LOG("OSMemory::SetPermission: %s\n", ((const char *)strerror(errno)));
+    ERROR_LOG("OSMemory::SetPermission: %s\n", ((const char *)strerror(saved_errno)));
   }
 
   return ret == 0;

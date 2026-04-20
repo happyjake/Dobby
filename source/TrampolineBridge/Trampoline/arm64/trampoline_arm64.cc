@@ -10,6 +10,14 @@
 #include "InstructionRelocation/arm64/InstructionRelocationARM64.h"
 #include "InterceptRouting/RoutingPlugin/RoutingPlugin.h"
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define DOBBY_DIAG_TRAMP(fmt, ...) \
+  __android_log_print(ANDROID_LOG_INFO, "Dobby-tramp", fmt, ##__VA_ARGS__)
+#else
+#define DOBBY_DIAG_TRAMP(fmt, ...) ((void)0)
+#endif
+
 using namespace zz::arm64;
 
 CodeBufferBase *GenerateNormalTrampolineBuffer(addr_t from, addr_t to) {
@@ -56,6 +64,9 @@ CodeBufferBase *GenerateNormalTrampolineBuffer(addr_t from, addr_t to) {
   turbo_assembler_.RelocBind();
 
   auto result = turbo_assembler_.GetCodeBuffer()->Copy();
+  DOBBY_DIAG_TRAMP("GenNormalTramp from=0x%lx to=0x%lx tramp_size=%zu",
+                   (unsigned long)from, (unsigned long)to,
+                   (size_t)result->GetBufferSize());
   return result;
 }
 

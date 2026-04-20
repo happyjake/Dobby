@@ -2,6 +2,14 @@
 
 #include "PlatformUnifiedInterface/MemoryAllocator.h"
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define DOBBY_DIAG_ALLOC(fmt, ...) \
+  __android_log_print(ANDROID_LOG_INFO, "Dobby-alloc", fmt, ##__VA_ARGS__)
+#else
+#define DOBBY_DIAG_ALLOC(fmt, ...) ((void)0)
+#endif
+
 MemBlock *MemoryArena::allocMemBlock(size_t size) {
   // insufficient memory
   if (this->end - this->cursor_addr < size) {
@@ -48,6 +56,7 @@ CodeMemoryArena *MemoryAllocator::allocateCodeMemoryArena(uint32_t size) {
 
   auto result = new CodeMemoryArena((addr_t)arena_addr, (size_t)arena_size);
   code_arenas.push_back(result);
+  DOBBY_DIAG_ALLOC("CodeArena new arena=%p size=0x%x", arena_addr, arena_size);
   return result;
 }
 

@@ -4,6 +4,14 @@
 
 #include "PlatformUtil/ProcessRuntimeUtility.h"
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define DOBBY_DIAG_ALLOC(fmt, ...) \
+  __android_log_print(ANDROID_LOG_INFO, "Dobby-alloc", fmt, ##__VA_ARGS__)
+#else
+#define DOBBY_DIAG_ALLOC(fmt, ...) ((void)0)
+#endif
+
 using namespace zz;
 
 #define KB (1024uLL)
@@ -193,6 +201,10 @@ MemBlock *NearMemoryAllocator::allocateNearBlockFromUnusedRegion(uint32_t size, 
   };
 
   auto unused_arena = register_near_arena(unused_arena_addr, unused_arena_size);
+  DOBBY_DIAG_ALLOC(
+      "NearArena pos=0x%lx range=0x%zx -> arena=0x%lx size=0x%zx exec=%d",
+      (unsigned long)pos, search_range, (unsigned long)unused_arena_addr,
+      (size_t)unused_arena_size, executable ? 1 : 0);
 
   // skip placeholder block
   // FIXME: allocate the placeholder but mark it as freed
