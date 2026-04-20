@@ -24,8 +24,27 @@ MemoryAllocator *MemoryAllocator::SharedAllocator() {
 CodeMemoryArena *MemoryAllocator::allocateCodeMemoryArena(uint32_t size) {
   CHECK_EQ(size % OSMemory::PageSize(), 0);
   uint32_t arena_size = size;
-  auto arena_addr = OSMemory::Allocate(arena_size, kNoAccess);
-  OSMemory::SetPermission(arena_addr, arena_size, kReadExecute);
+
+  // Old path was: mmap(PROT_NONE) + mprotect(R+X). On Android 16+ with
+  // MDWE inherited from zygote, the mprotect transition from NONE to
+  // R+X is blocked with EACCES because MDWE refuses *any* PROT_EXEC
+  // gain on a VMA that didn't previously have VM_EXEC (not just
+  // W->X). The arena silently stayed PROT_NONE and every write-then-
+  // execute attempt SIGSEGV'd.
+  //
+  // mmap(PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS) is permitted
+  // under MDWE because the new VMA is born R+X and never had W. So
+  // just allocate with R+X directly.
+  auto arena_addr = OSMemory::Allocate(arena_size, kReadExecute);
+  if (!arena_addr) {
+    // Fallback to the legacy path for platforms where direct R+X
+    // anonymous mmap is rejected but NONE -> mprotect(R+X) works.
+    arena_addr = OSMemory::Allocate(arena_size, kNoAccess);
+    if (arena_addr) {
+      OSMemory::SetPermission(arena_addr, arena_size, kReadExecute);
+    }
+  }
+  CHECK_NOT_NULL(arena_addr);
 
   auto result = new CodeMemoryArena((addr_t)arena_addr, (size_t)arena_size);
   code_arenas.push_back(result);
