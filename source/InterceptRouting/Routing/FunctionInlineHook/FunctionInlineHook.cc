@@ -185,6 +185,67 @@ static void dobby_mdwe_probe_once() {
   if (memfd_map != MAP_FAILED) munmap(memfd_map, PG);
   if (mfd >= 0) close(mfd);
   if (art_fd >= 0) close(art_fd);
+
+  // [7] Does file-backed R+X from /data work? If yes, we can switch Dobby's
+  // trampoline allocator from memfd to regular files.
+  const char *tf_paths[] = {
+    "/data/local/tmp/dobby-probe-trampoline.bin",
+    "/data/adb/modules/zygisk_vector/probe-trampoline.bin",
+    nullptr,
+  };
+  for (int i = 0; tf_paths[i]; i++) {
+    const char *p = tf_paths[i];
+    unlink(p);
+    int fd = open(p, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0755);
+    if (fd < 0) {
+      PROBE_LOG(WARN, "[7.%d] open(%s, CREAT) failed errno=%d (%s)",
+                i, p, errno, strerror(errno));
+      continue;
+    }
+    uint8_t zero[4096] = {0};
+    ssize_t w = write(fd, zero, PG);
+    if (w != (ssize_t)PG) {
+      PROBE_LOG(WARN, "[7.%d] write(%s) returned %zd errno=%d", i, p, w, errno);
+      close(fd);
+      unlink(p);
+      continue;
+    }
+    close(fd);
+    fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+      PROBE_LOG(WARN, "[7.%d] reopen(%s, RDONLY) failed errno=%d", i, p, errno);
+      unlink(p);
+      continue;
+    }
+    void *m = mmap(nullptr, PG, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    if (m == MAP_FAILED) {
+      PROBE_LOG(ERROR, "[7.%d] mmap(R+X, file %s) FAIL errno=%d (%s) "
+                       "<-- file-backed exec also blocked here",
+                i, p, errno, strerror(errno));
+    } else {
+      PROBE_LOG(INFO, "[7.%d] mmap(R+X, file %s) ok @ %p "
+                      "-- file-backed exec works, Dobby allocator can use this",
+                i, p, m);
+      munmap(m, PG);
+    }
+    close(fd);
+    unlink(p);
+  }
+
+  // [8] Pre-existing system executable -- sanity check that file exec in general
+  // works (we've shown this before but re-check from this process).
+  int sh_fd = open("/system/bin/sh", O_RDONLY | O_CLOEXEC);
+  if (sh_fd >= 0) {
+    void *m = mmap(nullptr, PG, PROT_READ | PROT_EXEC, MAP_PRIVATE, sh_fd, 0);
+    if (m == MAP_FAILED) {
+      PROBE_LOG(ERROR, "[8] mmap(R+X, /system/bin/sh) FAIL errno=%d", errno);
+    } else {
+      PROBE_LOG(INFO, "[8] mmap(R+X, /system/bin/sh) ok");
+      munmap(m, PG);
+    }
+    close(sh_fd);
+  }
+
   PROBE_LOG(INFO, "[probe] done");
 }
 #define RUN_MDWE_PROBE() dobby_mdwe_probe_once()
