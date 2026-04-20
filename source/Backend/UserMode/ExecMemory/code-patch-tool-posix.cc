@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -65,6 +66,36 @@
 // unconditionally, which is O(page_size) copy + one syscall round. No
 // measurable difference for LSPlant's ~20 init hooks.
 
+// Scan /proc/self/maps once to confirm the target page is both mapped and
+// executable. Without this, a caller passing a bogus address (stale symbol
+// cache, out-of-bounds computation) makes us memcpy from a PROT_NONE guard
+// page and SIGSEGV -- which the old mprotect-first path avoided because
+// mprotect(R+W) on a PROT_NONE VMA returns EACCES before any memory is
+// touched.
+static int page_is_executable(uintptr_t page_addr, size_t page_size) {
+  FILE *f = fopen("/proc/self/maps", "re");
+  if (!f) {
+    DOBBY_DIAG(WARN, "page_is_executable: fopen(/proc/self/maps) errno=%d (%s)",
+               errno, strerror(errno));
+    return 0;
+  }
+  char line[512];
+  int ok = 0;
+  while (fgets(line, sizeof(line), f)) {
+    unsigned long start = 0, end = 0;
+    char perms[5] = {0};
+    if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) >= 3) {
+      if (start <= page_addr && page_addr + page_size <= end) {
+        // perms is "rwxp" or "r-xp" etc. Index 2 is the exec char.
+        ok = (perms[2] == 'x') ? 1 : 0;
+        break;
+      }
+    }
+  }
+  fclose(f);
+  return ok;
+}
+
 static int memfd_patch_page(uintptr_t patch_page, size_t page_size,
                             uintptr_t offset_in_page,
                             const uint8_t *trampoline_bytes,
@@ -72,6 +103,13 @@ static int memfd_patch_page(uintptr_t patch_page, size_t page_size,
   if (offset_in_page + trampoline_size > page_size) {
     DOBBY_DIAG(ERROR, "memfd_patch: tramp %zu @ off %zu overflows page_size %zu",
                trampoline_size, offset_in_page, page_size);
+    return -1;
+  }
+  if (!page_is_executable(patch_page, page_size)) {
+    DOBBY_DIAG(WARN,
+               "memfd_patch: target page 0x%lx is not r-x (guard or unmapped), "
+               "refusing to patch",
+               (unsigned long)patch_page);
     return -1;
   }
 
